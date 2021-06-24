@@ -58,7 +58,7 @@ class DropTokenGame(object):
 
         # Directions to check for, first tuple is vertical checks, 2nd tuple is horizontal checks, 3rd and 4th are
         # the two varying diagonal checks
-        for delta_row, delta_col in [(1, 0), (0, 1), (1, 1), (-1, -1)]:
+        for delta_row, delta_col in [(1, 0), (0, 1), (1, 1), (1, -1)]:
             consecutive_moves = 1
 
             # This loops allows us to switch directions when we hit a boundary.
