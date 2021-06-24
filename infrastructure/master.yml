@@ -63,13 +63,13 @@ Resources:
               print(event)
               try:
                   # Retrieve github zip
-                  r = requests.get('https://github.com/vishalnayan/RESTAPIBackend/archive/refs/heads/main.zip')
-                  open('/tmp/main.zip', 'wb').write(r.content)
-                  with zipfile.ZipFile('/tmp/main.zip', 'r') as zip_ref:
+                  r = requests.get('https://github.com/vishalnayan/RESTAPIBackend/archive/main.zip')
+                  open('/tmp/RESTAPIBackend-main.zip', 'wb').write(r.content)
+                  with zipfile.ZipFile('/tmp/RESTAPIBackend-main.zip', 'r') as zip_ref:
                       zip_ref.extractall('/tmp/dt')
 
                   # Create new zip
-                  shutil.make_archive('/tmp/lambda', 'zip', '/tmp/dt/RESTAPIBackend/services/drop_token')
+                  shutil.make_archive('/tmp/lambda', 'zip', '/tmp/dt/RESTAPIBackend-main/services/drop_token')
 
                   # Upload zip to s3
                   s3.meta.client.upload_file('/tmp/lambda.zip', os.environ['S3_BUCKET'], 'lambda.zip')
