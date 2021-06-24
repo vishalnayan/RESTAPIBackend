@@ -1,0 +1,708 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "An API backend for the drop token game."
+
+Parameters:
+  LambdaMemory:
+    Description: "The base location of all the artifacts being used to spin up the environment"
+    Type: Number
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+    Default: 256
+  APIEnvironment:
+    Description: "The API staging environments"
+    Type: String
+    AllowedValues:
+      - "dev"
+      - "test"
+      - "prod"
+    Default: "dev"
+Resources:
+  ###
+  ### START LAMBDA CODE DEPLOYMENT INFRASTRUCTURE
+  ###
+
+  # Bucket where the code (zip) file is stored
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+
+  # This resource automatically calls the lambda that will put the code into the S3 bucket
+  DeployLambdaCaller:
+    DependsOn: DeployLambda
+    Type: Custom::LambdaDeployer
+    Properties:
+      ServiceToken: !GetAtt DeployLambda.Arn
+
+  # Grabs the code from the public GitHub, zips up the correct folder, and deploys it to S3 as a zip that the lambda
+  # can later reference
+  DeployLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Description: "Sets up S3 bucket with lambda code from GitHub"
+      MemorySize: !Ref LambdaMemory
+      Runtime: python3.7
+      Role: !GetAtt DeployRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref ArtifactsBucket
+      Code:
+        ZipFile: |
+          from botocore.vendored import requests
+          import zipfile
+          import shutil
+          import boto3
+          import os
+          import json
+
+          s3 = boto3.resource('s3')
+
+          def lambda_handler(event, context):
+              print(event)
+              try:
+                  # Retrieve github zip
+                  r = requests.get('https://github.com/vishalnayan/RESTAPIBackend/archive/refs/heads/main.zip')
+                  open('/tmp/main.zip', 'wb').write(r.content)
+                  with zipfile.ZipFile('/tmp/main.zip', 'r') as zip_ref:
+                      zip_ref.extractall('/tmp/dt')
+
+                  # Create new zip
+                  shutil.make_archive('/tmp/lambda', 'zip', '/tmp/dt/RESTAPIBackend/services/drop_token')
+
+                  # Upload zip to s3
+                  s3.meta.client.upload_file('/tmp/lambda.zip', os.environ['S3_BUCKET'], 'lambda.zip')
+              except Exception as e:
+                  print(str(e))
+
+
+              response_data = {}
+              print(event)
+
+              response_url = event.get('ResponseURL', None)
+              response_data['StackId'] = event.get('StackId', None)
+              response_data['RequestId'] = event.get('RequestId', None)
+              response_data['LogicalResourceId'] = event.get('LogicalResourceId', "")
+              response_data['PhysicalResourceId'] = event.get('PhysicalResourceId', f"{context.function_name}-{context.function_version}")
+              response_data['Data'] = {}
+              response_data['Reason'] = f"More information in CloudWatch."
+              response_data['Status'] = "SUCCESS"
+
+              json_response = json.dumps(response_data)
+              headers = {'content-type': '', 'content-length': str(len(json_response))}
+              try:
+                  response = requests.put(response_url, data=json_response, headers=headers)
+                  print(f"CloudFormation returned status code: {response.reason}")
+              except Exception as e:
+                  print(f"send(..) failed executing requests.put(..): {e}")
+                  raise
+
+              return response_data
+
+  # Role for the custom resource to automatically send the code to the S3 Bucket created
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 's3:PutObject'
+                Resource: !Sub "${ArtifactsBucket.Arn}/*"
+        - PolicyName: LogCreation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+  ###
+  ### FINISH LAMBDA CODE DEPLOYMENT INFRASTRUCTURE
+  ###
+
+  ###
+  ### START REGULAR INFRASTRUCTURE PROVISIONING (Lambda/Code, API, Database)
+  ###
+
+  # Creates the actual lambda that will be the business logic for all API invocations
+  DropTokenLambda:
+    DependsOn: DeployLambdaCaller
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Description: "The main business logic of the drop token game."
+      MemorySize: !Ref LambdaMemory
+      Runtime: python3.7
+      Role: !GetAtt DropTokenRole.Arn
+      Environment:
+        Variables:
+          DATABASE_NAME: !Ref DropTokenDatabase
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: "lambda.zip"
+
+  # The permissions attached to the lambda that allow it to talk to DynamoDB and produce logs to CloudWatch
+  DropTokenRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: '*'  # Keeping this open for simplicity, otherwise it'd be explicitly set
+                Resource: !GetAtt DropTokenDatabase.Arn
+        - PolicyName: LogCreation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream  # Could've made these based on specific lambda
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+  # The 'glue' between Lambda and API Gateway, which allows API Gateway to call this lambda
+  DropTokenLambdaInvoke:
+    DependsOn: API
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt DropTokenLambda.Arn
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${API}/*/*/*"
+
+  # Database where all the game data will be stored (NoSQL / DynamoDB)
+  # This scales 'on demand', so we don't need to predict workloads
+  DropTokenDatabase:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "gameId"
+          AttributeType: "S"
+      BillingMode: 'PAY_PER_REQUEST'
+      KeySchema:
+        -
+          AttributeName: "gameId"
+          KeyType: "HASH"
+
+  # Actual deploys the API to the public web
+  APIDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref API
+      StageName: !Ref APIEnvironment
+
+  # Creation of actual API
+  API:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Description: "An API interface to facilitate a game session of drop token to back end services."
+      Body:
+        Fn::Sub:
+          - |
+            openapi: "3.0.1"
+            info:
+              title: "98point6-hw-dt"
+              description: "An API interface to facilitate a game session of drop token to back\
+                \ end services."
+              version: "2020-08-19T23:44:29Z"
+            servers:
+            - url: "https://yu0eimm757.execute-api.${AWS::Region}.amazonaws.com/{basePath}"
+              variables:
+                basePath:
+                  default: "/dev"
+            paths:
+              /drop_token/{gameId}/moves/{move_number}:
+                get:
+                  parameters:
+                  - name: "move_number"
+                    in: "path"
+                    required: true
+                    schema:
+                      type: "string"
+                  - name: "gameId"
+                    in: "path"
+                    required: true
+                    schema:
+                      type: "string"
+                  responses:
+                    400:
+                      description: "400 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                    404:
+                      description: "404 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                    200:
+                      description: "200 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/ResponseGetMove"
+                  x-amazon-apigateway-integration:
+                    uri: "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaName}/invocations"
+                    responses:
+                      default:
+                        statusCode: "200"
+                      .*BAD_REQUEST.*:
+                        statusCode: "400"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\r\
+                            \n{\r\n  \"message\" : \"$errorMessageObj.message\"\r\n}"
+                      .*NOT_FOUND.*:
+                        statusCode: "404"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\r\
+                            \n{\r\n  \"message\" : \"$errorMessageObj.message\"\r\n}"
+                    requestTemplates:
+                      application/json: "{\r\n    \"resource\": \"$context.resourcePath\",\r\n\
+                        \    \"method\": \"$context.httpMethod\",\r\n    \"gameId\": \"$input.params('gameId')\"\
+                        ,\r\n\t\"move_number\": \"$input.params('move_number')\"\r\n}"
+                    passthroughBehavior: "when_no_templates"
+                    httpMethod: "POST"
+                    contentHandling: "CONVERT_TO_TEXT"
+                    type: "aws"
+              /drop_token/{gameId}:
+                get:
+                  parameters:
+                  - name: "gameId"
+                    in: "path"
+                    required: true
+                    schema:
+                      type: "string"
+                  responses:
+                    400:
+                      description: "400 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                    404:
+                      description: "404 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                    200:
+                      description: "200 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/ResponseGetGame"
+                  x-amazon-apigateway-integration:
+                    uri: "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaName}/invocations"
+                    responses:
+                      default:
+                        statusCode: "200"
+                      .*BAD_REQUEST.*:
+                        statusCode: "400"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\n\
+                            {\n  \"message\" : \"$errorMessageObj.message\"\n}"
+                      .*NOT_FOUND.*:
+                        statusCode: "404"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\n\
+                            {\n  \"message\" : \"$errorMessageObj.message\"\n}"
+                    requestTemplates:
+                      application/json: "{\n    \"resource\": \"$context.resourcePath\",\n   \
+                        \ \"method\": \"$context.httpMethod\",\n    \"gameId\": \"$input.params('gameId')\"\
+                        \n}"
+                    passthroughBehavior: "when_no_templates"
+                    httpMethod: "POST"
+                    contentHandling: "CONVERT_TO_TEXT"
+                    type: "aws"
+              /drop_token/{gameId}/{playerId}:
+                post:
+                  parameters:
+                  - name: "playerId"
+                    in: "path"
+                    required: true
+                    schema:
+                      type: "string"
+                  - name: "gameId"
+                    in: "path"
+                    required: true
+                    schema:
+                      type: "string"
+                  requestBody:
+                    content:
+                      application/json:
+                        schema:
+                          $ref: "#/components/schemas/RequestCreateMove"
+                    required: true
+                  responses:
+                    404:
+                      description: "404 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                    200:
+                      description: "200 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/ResponseCreateMove"
+                    410:
+                      description: "410 response"
+                      content: {}
+                    400:
+                      description: "400 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                    409:
+                      description: "409 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                  x-amazon-apigateway-request-validator: "Validate body"
+                  x-amazon-apigateway-integration:
+                    uri: "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaName}/invocations"
+                    responses:
+                      .*BAD_REQUEST.*:
+                        statusCode: "400"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\r\
+                            \n{\r\n  \"message\" : \"$errorMessageObj.message\"\r\n}"
+                      default:
+                        statusCode: "200"
+                      .*NOT_FOUND.*:
+                        statusCode: "404"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\r\
+                            \n{\r\n  \"message\" : \"$errorMessageObj.message\"\r\n}"
+                      .*CONFLICT.*:
+                        statusCode: "409"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\r\
+                            \n{\r\n  \"message\" : \"$errorMessageObj.message\"\r\n}"
+                      .*GONE.*:
+                        statusCode: "410"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\r\
+                            \n{\r\n  \"message\" : \"$errorMessageObj.message\"\r\n}"
+                    requestTemplates:
+                      application/json: "{\r\n    \"resource\": \"$context.resourcePath\",\r\n\
+                        \    \"method\": \"$context.httpMethod\",\r\n    \"gameId\": \"$input.params('gameId')\"\
+                        ,\r\n    \"playerId\": \"$input.params('playerId')\",\r\n\t\"body\": $input.json('$')\r\
+                        \n}"
+                    passthroughBehavior: "when_no_templates"
+                    httpMethod: "POST"
+                    contentHandling: "CONVERT_TO_TEXT"
+                    type: "aws"
+                delete:
+                  parameters:
+                  - name: "playerId"
+                    in: "path"
+                    required: true
+                    schema:
+                      type: "string"
+                  - name: "gameId"
+                    in: "path"
+                    required: true
+                    schema:
+                      type: "string"
+                  responses:
+                    202:
+                      description: "202 response"
+                      content: {}
+                    404:
+                      description: "404 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                    410:
+                      description: "410 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                  x-amazon-apigateway-integration:
+                    uri: "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaName}/invocations"
+                    responses:
+                      default:
+                        statusCode: "202"
+                      .*NOT_FOUND.*:
+                        statusCode: "404"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\r\
+                            \n{\r\n  \"message\" : \"$errorMessageObj.message\"\r\n}"
+                      .*GONE.*:
+                        statusCode: "410"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\r\
+                            \n{\r\n  \"message\" : \"$errorMessageObj.message\"\r\n}"
+                    requestTemplates:
+                      application/json: "{\r\n    \"resource\": \"$context.resourcePath\",\r\n\
+                        \    \"method\": \"$context.httpMethod\",\r\n    \"gameId\": \"$input.params('gameId')\"\
+                        ,\r\n    \"playerId\": \"$input.params('playerId')\"\r\n}"
+                    passthroughBehavior: "when_no_templates"
+                    httpMethod: "POST"
+                    contentHandling: "CONVERT_TO_TEXT"
+                    type: "aws"
+              /drop_token:
+                get:
+                  responses:
+                    200:
+                      description: "200 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/ResponseGetGames"
+                  x-amazon-apigateway-integration:
+                    uri: "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaName}/invocations"
+                    responses:
+                      default:
+                        statusCode: "200"
+                    requestTemplates:
+                      application/json: "{\n    \"resource\": \"$context.resourcePath\",\n   \
+                        \ \"method\": \"$context.httpMethod\"\n}"
+                    passthroughBehavior: "when_no_templates"
+                    httpMethod: "POST"
+                    contentHandling: "CONVERT_TO_TEXT"
+                    type: "aws"
+                post:
+                  requestBody:
+                    content:
+                      application/json:
+                        schema:
+                          $ref: "#/components/schemas/RequestCreateGame"
+                    required: true
+                  responses:
+                    400:
+                      description: "400 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                    200:
+                      description: "200 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/ResponseCreateGame"
+                  x-amazon-apigateway-request-validator: "Validate body"
+                  x-amazon-apigateway-integration:
+                    uri: "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaName}/invocations"
+                    responses:
+                      default:
+                        statusCode: "200"
+                      .*BAD_REQUEST.*:
+                        statusCode: "400"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\r\
+                            \n{\r\n  \"message\" : \"$errorMessageObj.message\"\r\n}"
+                    requestTemplates:
+                      application/json: "{\n    \"resource\": \"$context.resourcePath\",\n   \
+                        \ \"method\": \"$context.httpMethod\",\n    \"body\": $input.json('$')\n\
+                        }"
+                    passthroughBehavior: "when_no_templates"
+                    httpMethod: "POST"
+                    contentHandling: "CONVERT_TO_TEXT"
+                    type: "aws"
+              /drop_token/{gameId}/moves:
+                get:
+                  parameters:
+                  - name: "start"
+                    in: "query"
+                    schema:
+                      type: "string"
+                  - name: "gameId"
+                    in: "path"
+                    required: true
+                    schema:
+                      type: "string"
+                  - name: "until"
+                    in: "query"
+                    schema:
+                      type: "string"
+                  responses:
+                    400:
+                      description: "400 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                    404:
+                      description: "404 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/Error"
+                    200:
+                      description: "200 response"
+                      content:
+                        application/json:
+                          schema:
+                            $ref: "#/components/schemas/ResponseGetMoves"
+                  x-amazon-apigateway-integration:
+                    uri: "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaName}/invocations"
+                    responses:
+                      default:
+                        statusCode: "200"
+                      .*BAD_REQUEST.*:
+                        statusCode: "400"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\n\
+                            {\n  \"message\" : \"$errorMessageObj.message\"\n}"
+                      .*NOT_FOUND.*:
+                        statusCode: "404"
+                        responseTemplates:
+                          application/json: "#set($errorMessageObj  = $util.parseJson($input.path('$.errorMessage')))\n\
+                            {\n  \"message\" : \"$errorMessageObj.message\"\n}"
+                    requestTemplates:
+                      application/json: "{\n    \"resource\": \"$context.resourcePath\",\n   \
+                        \ \"method\": \"$context.httpMethod\",\n    \"gameId\": \"$input.params('gameId')\"\
+                        ,\n    \"start\": \"$input.params('start')\",\n    \"until\": \"$input.params('until')\"\
+                        \n}"
+                    passthroughBehavior: "when_no_templates"
+                    httpMethod: "POST"
+                    contentHandling: "CONVERT_TO_TEXT"
+                    type: "aws"
+            components:
+              schemas:
+                ResponseCreateMove:
+                  type: "object"
+                  properties:
+                    move:
+                      type: "string"
+                ResponseGetMove:
+                  type: "object"
+                  properties:
+                    type:
+                      type: "string"
+                    player:
+                      type: "string"
+                    column:
+                      type: "integer"
+                      format: "int32"
+                ResponseCreateGame:
+                  type: "object"
+                  properties:
+                    gameId:
+                      type: "string"
+                ResponseGetGames:
+                  type: "object"
+                  properties:
+                    games:
+                      uniqueItems: true
+                      type: "array"
+                      items:
+                        type: "string"
+                ResponseGetGame:
+                  type: "object"
+                  properties:
+                    players:
+                      uniqueItems: true
+                      type: "array"
+                      items:
+                        type: "string"
+                    state:
+                      type: "string"
+                    winner:
+                      type: "string"
+                Error:
+                  title: "Error Schema"
+                  type: "object"
+                  properties:
+                    error:
+                      type: "string"
+                RequestCreateGame:
+                  required:
+                  - "columns"
+                  - "players"
+                  - "rows"
+                  type: "object"
+                  properties:
+                    players:
+                      maxItems: 2
+                      minItems: 2
+                      uniqueItems: true
+                      type: "array"
+                      items:
+                        type: "string"
+                    columns:
+                      maximum: 20
+                      minimum: 2
+                      type: "integer"
+                      format: "int32"
+                    rows:
+                      maximum: 20
+                      minimum: 2
+                      type: "integer"
+                      format: "int32"
+                RequestCreateMove:
+                  required:
+                  - "column"
+                  type: "object"
+                  properties:
+                    column:
+                      type: "integer"
+                      format: "int32"
+                ResponseGetMoves:
+                  type: "object"
+                  properties:
+                    moves:
+                      uniqueItems: true
+                      type: "array"
+                      items:
+                        type: "object"
+                        properties:
+                          type:
+                            type: "string"
+                          player:
+                            type: "string"
+                          column:
+                            type: "integer"
+                            format: "int32"
+            x-amazon-apigateway-request-validators:
+              Validate body:
+                validateRequestParameters: false
+                validateRequestBody: true
+          - LambdaName: !Ref DropTokenLambda
+
+Outputs:
+  APIEndPoint:
+    Description: "API base URL endpoint"
+    Value: !Sub "https://${API}.execute-api.${AWS::Region}.amazonaws.com/${APIEnvironment}/"
