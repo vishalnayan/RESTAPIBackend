@@ -79,7 +79,6 @@ class DropTokenSession(object):
         if len(moves) == 0:
             raise NotFound('No moves found.')
 
-        # todo: not sure why this is happening right now, but move numbers are being returned as floats
         for item in moves:
             item['column'] = int(item['column'])
         return moves

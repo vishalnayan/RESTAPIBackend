@@ -93,7 +93,7 @@ def lambda_handler(event, _):
                 dt_session.quit_game()
                 return
 
-            # Player is making a move! This is where the fun happens!
+            # Player is making a move!
             elif event['method'] == 'POST':
                 # VALIDATE: Move is an unsigned integer
                 validate.unsigned_integer_values(event['body']['column'])
